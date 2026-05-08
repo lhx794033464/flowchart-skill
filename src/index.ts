@@ -1,12 +1,13 @@
 /**
  * 流程图生成技能 - 核心入口
  *
+ * 本技能不内置 LLM，所有 LLM 调用均通过外部注入的 LLMProvider 完成。
  * 提供两个主要函数：
  * - generateFlowchart: 通用流程图生成
  * - generateFlowchartWithDomain: 领域定制流程图生成
  */
 
-import { callLLM, type LLMConfig, type Message } from './llm.js';
+import { callLLMWithRetry, type LLMProvider, type Message } from './llm.js';
 import { buildSystemPrompt } from './prompts.js';
 import { validateAndCleanXml, validateXmlStructure } from './xml-processor.js';
 
@@ -15,8 +16,12 @@ export interface FlowchartOptions {
   prompt: string;
   /** 布局方向 */
   direction?: 'vertical' | 'horizontal';
-  /** LLM 模型配置 */
-  llmConfig?: LLMConfig;
+  /** 外部注入的 LLM 实例（必需） */
+  llm: LLMProvider;
+  /** 模型配置 */
+  model?: string;
+  /** 温度 */
+  temperature?: number;
 }
 
 export interface FlowchartWithDomainOptions extends FlowchartOptions {
@@ -44,9 +49,11 @@ export interface FlowchartResult {
  * ```ts
  * import { generateFlowchart } from './flowchart-skill';
  *
+ * // WorkBuddy 注入的 LLM 实例
  * const result = await generateFlowchart({
  *   prompt: '采购申请单 -> 采购订单 -> 采购入库单 -> 付款单',
- *   direction: 'vertical'
+ *   direction: 'vertical',
+ *   llm: workbuddyLLM // 注入的 LLMProvider
  * });
  *
  * if (result.success) {
@@ -57,7 +64,7 @@ export interface FlowchartResult {
 export async function generateFlowchart(
   options: FlowchartOptions
 ): Promise<FlowchartResult> {
-  const { prompt, direction = 'vertical', llmConfig } = options;
+  const { prompt, direction = 'vertical', llm, model, temperature } = options;
 
   const systemPrompt = buildSystemPrompt();
   const dirText = direction === 'horizontal' ? '水平' : '垂直';
@@ -69,7 +76,7 @@ export async function generateFlowchart(
   ];
 
   try {
-    const result = await callLLM(messages, llmConfig);
+    const result = await callLLMWithRetry(llm, messages, { model, temperature });
     const xml = validateAndCleanXml(result);
     const validation = validateXmlStructure(xml);
 
@@ -99,14 +106,15 @@ export async function generateFlowchart(
  *   prompt: '销售订单 -> 发货通知 -> 销售出库单 -> 销售发票 -> 收款单',
  *   domainName: '金蝶云星辰',
  *   domainTerms: ['销售订单', '销售出库单', '收款单'],
- *   direction: 'vertical'
+ *   direction: 'vertical',
+ *   llm: workbuddyLLM // 注入的 LLMProvider
  * });
  * ```
  */
 export async function generateFlowchartWithDomain(
   options: FlowchartWithDomainOptions
 ): Promise<FlowchartResult> {
-  const { prompt, direction = 'vertical', domainName, domainTerms, extraPrompt, llmConfig } = options;
+  const { prompt, direction = 'vertical', domainName, domainTerms, extraPrompt, llm, model, temperature } = options;
 
   const systemPrompt = buildSystemPrompt(domainName, domainTerms, extraPrompt);
   const dirText = direction === 'horizontal' ? '水平' : '垂直';
@@ -118,7 +126,7 @@ export async function generateFlowchartWithDomain(
   ];
 
   try {
-    const result = await callLLM(messages, llmConfig);
+    const result = await callLLMWithRetry(llm, messages, { model, temperature });
     const xml = validateAndCleanXml(result);
     const validation = validateXmlStructure(xml);
 
@@ -137,6 +145,6 @@ export async function generateFlowchartWithDomain(
 }
 
 // 导出子模块供高级用户直接使用
-export { callLLM, callLLMStream, callLLMInvoke, type LLMConfig, type Message } from './llm.js';
+export { callLLMWithRetry, type LLMProvider, type Message } from './llm.js';
 export { buildSystemPrompt, FLOWCHART_SYSTEM_PROMPT } from './prompts.js';
 export { validateAndCleanXml, validateXmlStructure } from './xml-processor.js';

@@ -1,6 +1,8 @@
 /**
- * LLM 调用封装
- * 接受外部注入的 LLMClient，不直接依赖 SDK
+ * LLM Provider 接口定义
+ *
+ * 本技能不内置任何 LLM 客户端，完全依赖外部注入。
+ * WorkBuddy 或其他宿主环境需提供符合此接口的 LLM 实例。
  */
 
 export type Message = {
@@ -8,96 +10,55 @@ export type Message = {
   content: string;
 };
 
-export interface LLMConfig {
-  model?: string;
-  temperature?: number;
-  apiKey?: string;
-  baseURL?: string;
+/**
+ * LLM Provider 接口
+ *
+ * 与 coze-coding-dev-sdk 的 LLMClient 兼容：
+ * - stream() 返回的 chunk 应有 content 属性（string | Buffer）
+ * - invoke() 返回的对象应有 content 属性（string）
+ */
+export interface LLMProvider {
+  stream(
+    messages: Message[],
+    config?: { model?: string; temperature?: number; [key: string]: unknown }
+  ): AsyncIterable<{ content?: unknown }>;
+
+  invoke(
+    messages: Message[],
+    config?: { model?: string; temperature?: number; [key: string]: unknown }
+  ): Promise<{ content?: unknown }>;
 }
 
-export interface LLMClientLike {
-  stream: (messages: Message[], config: LLMConfig) => AsyncIterable<{ text: string }>;
-  invoke: (messages: Message[], config: LLMConfig) => Promise<{ text: string }>;
-}
-
-export function createLLMClient(config?: LLMConfig): LLMClientLike {
-  const apiKey = config?.apiKey || process.env.COZE_API_TOKEN || '';
-  const baseURL = config?.baseURL || process.env.COZE_INTEGRATION_MODEL_BASE_URL || '';
-  const model = config?.model || 'doubao-seed-2-0-pro-260215';
-
-  return {
-    async *stream(messages: Message[], cfg: LLMConfig) {
-      const resp = await fetch(`${baseURL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: cfg.model || model,
-          messages: messages as unknown as Record<string, unknown>[],
-          stream: true,
-          temperature: cfg.temperature ?? 0.01,
-        }),
-      });
-      if (!resp.ok) {
-        const err = await resp.text();
-        throw new Error(`LLM API error ${resp.status}: ${err}`);
-      }
-      const reader = resp.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data:')) continue;
-          const jsonStr = trimmed.slice(5).trim();
-          if (jsonStr === '[DONE]') continue;
-          try {
-            const chunk = JSON.parse(jsonStr);
-            const text = chunk.choices?.[0]?.delta?.content || '';
-            if (text) yield { text };
-          } catch { /* ignore parse errors */ }
-        }
-      }
-    },
-
-    async invoke(messages: Message[], cfg: LLMConfig) {
-      const resp = await fetch(`${baseURL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: cfg.model || model,
-          messages: messages as unknown as Record<string, unknown>[],
-          stream: false,
-          temperature: cfg.temperature ?? 0.01,
-        }),
-      });
-      if (!resp.ok) {
-        const err = await resp.text();
-        throw new Error(`LLM API error ${resp.status}: ${err}`);
-      }
-      const data = await resp.json() as { choices: Array<{ message: { content: string } }> };
-      return { text: data.choices[0]?.message?.content || '' };
-    },
-  };
-}
-
-/** 主模型 + 降级模型 */
+/** 主模型 + 降级模型（仅作为默认建议，实际由注入方控制） */
 export const PRIMARY_MODEL = 'doubao-seed-2-0-pro-260215';
 export const FALLBACK_MODEL = 'deepseek-v3-2-251201';
 
-/** 调用 LLM，自动流式 + 截断重试 */
+/** 辅助函数：从 chunk 中提取文本（兼容 string / Buffer / 其他） */
+function extractText(chunk: { content?: unknown }): string {
+  if (chunk.content == null) return '';
+  if (typeof chunk.content === 'string') return chunk.content;
+  // 兼容 Buffer、Uint8Array 等含 toString 的对象
+  const maybe = chunk.content as { toString?: () => string };
+  if (typeof maybe.toString === 'function') {
+    return maybe.toString();
+  }
+  return String(chunk.content);
+}
+
+/** 辅助函数：从响应中提取文本 */
+function extractResponseText(result: { content?: unknown }): string {
+  return extractText(result);
+}
+
+/**
+ * 调用 LLM，自动流式 + 截断重试
+ *
+ * @param llm - 外部注入的 LLMProvider 实例（必需）
+ * @param messages - 消息列表
+ * @param opts - 可选配置（模型、温度、最大重试次数）
+ */
 export async function callLLMWithRetry(
-  client: LLMClientLike,
+  llm: LLMProvider,
   messages: Message[],
   opts?: { model?: string; temperature?: number; maxRetries?: number }
 ): Promise<string> {
@@ -114,15 +75,15 @@ export async function callLLMWithRetry(
     const attempt = attempts[i];
     try {
       if (attempt.mode === 'stream') {
-        const stream = client.stream(attempt.msgs, { model: attempt.model, temperature: opts?.temperature });
+        const stream = llm.stream(attempt.msgs, { model: attempt.model, temperature: opts?.temperature });
         let full = '';
         for await (const chunk of stream) {
-          full += chunk.text;
+          full += extractText(chunk);
         }
         return full;
       } else {
-        const result = await client.invoke(attempt.msgs, { model: attempt.model, temperature: opts?.temperature });
-        return result.text;
+        const result = await llm.invoke(attempt.msgs, { model: attempt.model, temperature: opts?.temperature });
+        return extractResponseText(result);
       }
     } catch (err) {
       lastErr = err instanceof Error ? err : new Error(String(err));
@@ -130,35 +91,4 @@ export async function callLLMWithRetry(
   }
 
   throw lastErr || new Error('LLM调用全部失败');
-}
-
-/** 简化入口：创建默认客户端并调用 */
-export async function callLLM(
-  messages: Message[],
-  config?: LLMConfig
-): Promise<string> {
-  const client = createLLMClient(config);
-  return callLLMWithRetry(client, messages);
-}
-
-/** 流式调用入口（供高级用户直接使用） */
-export async function* callLLMStream(
-  messages: Message[],
-  config?: LLMConfig
-): AsyncGenerator<string> {
-  const client = createLLMClient(config);
-  const cfg = { model: config?.model || PRIMARY_MODEL };
-  for await (const chunk of client.stream(messages, cfg)) {
-    yield chunk.text;
-  }
-}
-
-/** 非流式调用入口（供高级用户直接使用） */
-export async function callLLMInvoke(
-  messages: Message[],
-  config?: LLMConfig
-): Promise<string> {
-  const client = createLLMClient(config);
-  const result = await client.invoke(messages, { model: config?.model || PRIMARY_MODEL });
-  return result.text;
 }
